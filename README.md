@@ -17,10 +17,10 @@ def fused_softmax_topk(gating_output, k):
 - topk_weights：形状是(128, 4)，含义是每个token对应的top4的专家的score(val: 0~1)，作为加权求和的权值
 - topk_indices：形状是(128, 4)，含义是每个token对应的top4的专家的索引(val: 0~59)
 - token_expert_indices：形状是(128, 4)，是一张索引表，下一个算子会用到，其含义是：
-    - 0~127 表示 token1~128 的 top1
-    - 128~255 表示 token1~128 的 top2
-    - 256~383 表示 token1~128 的 top3
-    - 384~511 表示 token1~128 的 top4
+    - 0-127 表示 token1-128 的 top1
+    - 128-255 表示 token1-128 的 top2
+    - 256-383 表示 token1-128 的 top3
+    - 384-511 表示 token1-128 的 top4
 ```
 tensor([[  0, 128, 256, 384],
         [  1, 129, 257, 385],
