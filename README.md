@@ -233,7 +233,7 @@ def moe_routing(gemm_outputs, topk_weights, dst_2_src_line):
     return outputs
 ```
 
-## 测试输出
+# 测试输出
 ```shell
 $ python qwen_moe_block.py
 
