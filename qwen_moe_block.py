@@ -28,7 +28,7 @@ class Qwen2MoeConfig():
         moe_intermediate_size=1408,
         shared_expert_intermediate_size=5632,
         num_experts_per_tok=4,
-        num_experts=60,
+        num_experts=64,
         norm_topk_prob=False,
         output_router_logits=False,
         router_aux_loss_coef=0.001,
@@ -81,7 +81,7 @@ class Qwen2MoeMLP(nn.Module):
 class Qwen2MoeSparseMoeBlock(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.num_experts = config.num_experts  # 60, 60个专家
+        self.num_experts = config.num_experts  # 64, 64个专家
         self.top_k = config.num_experts_per_tok  # 4, top_4
         self.norm_topk_prob = config.norm_topk_prob  # false
 
@@ -99,10 +99,10 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         batch_size, sequence_length, hidden_dim = hidden_states.shape  # torch.Size([1, 128, 2048])
         hidden_states = hidden_states.view(-1, hidden_dim)             # torch.Size([128, 2048])
         # router_logits: (batch * sequence_length, n_experts)
-        router_logits = self.gate(hidden_states)                       # torch.Size([128, 60]), 60是专家数量, Gate_Layer是一个线性层，用于选专家
+        router_logits = self.gate(hidden_states)                       # torch.Size([128, 64]), 64是专家数量, Gate_Layer是一个线性层，用于选专家
 
 
-        routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)  # torch.Size([128, 60]), 对每一行做softmax, 获得每个token对60个专家的得分
+        routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)  # torch.Size([128, 64]), 对每一行做softmax, 获得每个token对64个专家的得分
         routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)  # torch.Size([128, 4]), torch.Size([128, 4]), 每个token对应的top4专家的权值，和专家索引
         if self.norm_topk_prob:  # 如果为True, 则再做一次归一化
             routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
@@ -115,10 +115,10 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
 
         # One hot encode the selected experts to create an expert mask
         # this will be used to easily index which expert is going to be sollicitated
-        expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)  # torch.Size([60, 4, 128]), 每个专家是哪些token的top_x
+        expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)  # torch.Size([64, 4, 128]), 每个专家是哪些token的top_x
 
         # Loop over all available experts in the model and perform the computation on each expert
-        for expert_idx in range(self.num_experts):  # 遍历60个专家
+        for expert_idx in range(self.num_experts):  # 遍历64个专家
             expert_layer = self.experts[expert_idx]
             top_x, idx = torch.where(expert_mask[expert_idx])  # expert_mask[0]是[4,128],表示专家0对应哪些token(idx:[0~128, ...])的top_x([0~3, ...])，
 
@@ -218,7 +218,7 @@ def compute_total_rows_before_expert(sorted_experts, num_experts):
     """
     计算每个专家在 sorted_experts 中出现的总行数。
     """
-    total_rows_before_expert = [0] * num_experts  # List, len=60
+    total_rows_before_expert = [0] * num_experts  # List, len=64
     for expert in range(num_experts):
         total_rows_before_expert[expert] = find_total_elts_leq_target(sorted_experts, expert)
     return np.array(total_rows_before_expert)
@@ -271,7 +271,7 @@ def dict_sort(topk_indices,token_expert_indices):
     return torch.tensor(sorted_keys),torch.tensor(sorted_values)
 
 @torch.no_grad()
-def expert_copy(inputs, sorted_token_expert_indices):
+def expert_copy(inputs, sorted_token_expert_indices, k):
     seq_len, hidden_units = inputs.shape  # [128, 2048]
     copy_outputs = torch.zeros(seq_len*k, hidden_units).half()  # torch.Size([512, 2048]), 每个token要分配4个专家
     dst_2_src_line = torch.zeros(seq_len*k, dtype=torch.int32)  # torch.Size([512]), 记录每行对应
@@ -288,13 +288,13 @@ def gated_silu(x, dimension):
 
 @torch.no_grad()
 def do_expertv2(copy_outputs,moe_weight1,moe_weight2,total_rows_before_expert):
-    # copy_outputs.shape = torch.Size([512, 2048]), moe_weight1.shape = torch.Size([60, 2048, 2816]), moe_weight2.shape = torch.Size([60, 1408, 2048])
+    # copy_outputs.shape = torch.Size([512, 2048]), moe_weight1.shape = torch.Size([64, 2048, 2816]), moe_weight2.shape = torch.Size([64, 1408, 2048])
     gemm_outputs1 = torch.zeros(copy_outputs.shape[0],moe_weight1.shape[-1]).half()  # torch.Size([512, 1408*2])
     gemm_outputs2 = torch.zeros(copy_outputs.shape[0],moe_weight2.shape[-1]).half()  # torch.Size([512, 2048])
 
 
     pre_value=0
-    for i in range(len(total_rows_before_expert)):  # [0, 60)
+    for i in range(len(total_rows_before_expert)):  # [0, 64)
         if(i!=0):
             pre_value = total_rows_before_expert[i-1]
         
@@ -359,13 +359,28 @@ def fused_sigmoid_dot_add(expert_output, shared_expert_output, shared_gate_outpu
 
 @torch.no_grad()
 def mymoe_block(inputs,k,gate_mlp,m1,m2,s1,s2,gate):
+    """MoE block
+
+    Args:
+        inputs (tensor): 输入张量, size=[bs, seq_len, hidden_dim]=(1,128,2048)
+        k (int): top `k`, 4
+        gate_mlp (nn.module): gating layer, 输出shape[128,64]
+        m1 (tensor): [64, 2048, 1408*2]
+        m2 (tensor): [64, 1408, 2048]
+        s1 (tensor): [2048, 5632*2]
+        s2 (tensor): [5632, 2048]
+        gate (nn.module): shared_expert_gate
+
+    Returns:
+        out (tensor): 和inputs shape相同，[bs, seq_len, hidden_dim]=(1,128,2048)
+    """
     inputs = inputs.view(-1, inputs.shape[-1])  # [128, 2048]
-    gate_outputs = gate_mlp(inputs)             # [128, 60]
+    gate_outputs = gate_mlp(inputs)             # [128, 64]
 
     topk_weights, topk_indices, token_expert_indices = fused_softmax_topk(gate_outputs, k)
     sorted_topk_indices2, sorted_token_expert_indices2 = expert_resetv2(topk_indices, token_expert_indices)
-    copy_outputs, dst_2_src_line = expert_copy(inputs, sorted_token_expert_indices2)
-    total_rows_before_expert = compute_total_rows_before_expert(sorted_topk_indices2.tolist(), 60)
+    copy_outputs, dst_2_src_line = expert_copy(inputs, sorted_token_expert_indices2, k)
+    total_rows_before_expert = compute_total_rows_before_expert(sorted_topk_indices2.tolist(), 64)
     moe_gemm_outputs = do_expertv2(copy_outputs, m1, m2, total_rows_before_expert)
     final_outputs = moe_routing(moe_gemm_outputs, topk_weights, dst_2_src_line)
 
@@ -384,7 +399,7 @@ if __name__ == "__main__":
     qwen_moe_block = Qwen2MoeSparseMoeBlock(config).eval().half()
     get_weight(qwen_moe_block)
     with torch.no_grad():
-        m1, m2 = get_expert_weight(qwen_moe_block)  # [60, 2048, 1408*2], [60, 1408, 2048]
+        m1, m2 = get_expert_weight(qwen_moe_block)  # [64, 2048, 1408*2], [64, 1408, 2048]
         s1, s2 = get_shared_expert_weight(qwen_moe_block)  # [2048, 5632*2], [5632, 2048]
         huggingface_outputs = qwen_moe_block(inputs)  # [seq_len, hidden_dim], [128, 2048]
         my_outputs = mymoe_block(inputs, k, qwen_moe_block.gate, m1, m2, s1, s2, qwen_moe_block.shared_expert_gate)
