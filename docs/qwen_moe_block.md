@@ -170,7 +170,7 @@ total_rows_before_expert 是一个**前缀表**，我们分析前三个元素：
 每个专家计算自己负责的token，需要经过下面这些层：
 
 <div align=center>
-<img src="../assets/Qwen2MoeMLP.png" width = "200"/>
+<img src="./assets/Qwen2MoeMLP.png" width = "200"/>
 </div>
 
 ```python
