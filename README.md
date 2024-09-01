@@ -2,7 +2,7 @@
 实现 Qwen1.5-MOE-A2.7B 大模型中 MoE-FFN 层所需的前向算子，并与 Pytorch 推理源码进行精度对齐。
 
 ## MoE-FFN 流程
-参考 [qwen_moe_block.md](MoE_inference/docs/qwen_moe_block.md) 。
+参考 [qwen_moe_block.md](./docs/qwen_moe_block.md) 。
 
 ## 测试 CUDA 算子
 requirements：
