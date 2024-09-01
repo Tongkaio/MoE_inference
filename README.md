@@ -1,7 +1,8 @@
-# requirements
-CUDA >= 11.0
-CMake >= 3.18
+requirements：
+- CUDA >= 11.0
+- CMake >= 3.18
 
+编译运行：
 ```shell
 # 编译
 mkdir build && cd build
