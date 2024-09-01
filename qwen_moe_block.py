@@ -78,6 +78,7 @@ class Qwen2MoeMLP(nn.Module):
     def forward(self, x):
         return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
+
 class Qwen2MoeSparseMoeBlock(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -133,17 +134,17 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             final_hidden_states.index_add_(0, idx, current_hidden_states.to(hidden_states.dtype))
 
 
-        shared_expert_output = self.shared_expert(hidden_states)
+        # shared_expert_output = self.shared_expert(hidden_states)
 
-        shared_expert_output = F.sigmoid(self.shared_expert_gate(hidden_states)) * shared_expert_output
+        # shared_expert_output = F.sigmoid(self.shared_expert_gate(hidden_states)) * shared_expert_output
 
-        final_hidden_states = final_hidden_states + shared_expert_output  # torch.Size([128, 2048])
+        # final_hidden_states = final_hidden_states + shared_expert_output  # torch.Size([128, 2048])
 
-        # final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
+        # # final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
         return final_hidden_states
 
 
-def get_shared_expert_weight(model):
+def get_shared_expert_weight_T(model):
     model = model.shared_expert
 
     weight_list  = []
@@ -157,7 +158,7 @@ def get_shared_expert_weight(model):
     return linear_weight1, linear_weight2
 
 
-def get_gate_weight(model):
+def get_gate_weight_T(model):
     model = model.gate
     weight_list  = []
 
@@ -169,7 +170,7 @@ def get_gate_weight(model):
     weight = weight_list[0].T
     return weight
 
-def get_expert_weight(model):
+def get_expert_weight_T(model):
     linear_weight1=[]
     linear_weight2=[]
 
@@ -186,23 +187,41 @@ def get_expert_weight(model):
     expert_weight1 = torch.cat(linear_weight1,dim=0)
     expert_weight2 = torch.cat(linear_weight2,dim=0)
 
-    return expert_weight1,expert_weight2
+    return expert_weight1, expert_weight2
 
 
-def get_shared_expert_gate_weight(model):
+def get_expert_weight(model):
+    linear_weight1=[]
+    linear_weight2=[]
+
+    model = model.experts
+
+    for item in model:
+        gate_proj_weight= item.gate_proj.weight.detach()
+        up_proj_weight = item.up_proj.weight.detach()
+        down_proj_weight = item.down_proj.weight.detach()
+
+        linear_weight1.append((torch.cat([gate_proj_weight,up_proj_weight],dim=0))[None])
+        linear_weight2.append((down_proj_weight)[None])
+
+    expert_weight1 = torch.cat(linear_weight1,dim=0)
+    expert_weight2 = torch.cat(linear_weight2,dim=0)
+
+    return expert_weight1, expert_weight2
+
+
+def get_shared_expert_gate_weight_T(model):
     model=model.shared_expert_gate
     weight = model.weight.detach().T
-
 
     return weight
 
 
 def get_weight(model):
-
-    get_gate_weight(model)
-    get_expert_weight(model)
-    get_shared_expert_weight(model)
-    get_shared_expert_gate_weight(model)
+    get_gate_weight_T(model)
+    get_expert_weight_T(model)
+    get_shared_expert_weight_T(model)
+    get_shared_expert_gate_weight_T(model)
 
 import bisect
 
@@ -224,7 +243,7 @@ def compute_total_rows_before_expert(sorted_experts, num_experts):
     return np.array(total_rows_before_expert)
 
 @torch.no_grad()
-def expert_resetv2(topk_indices,token_expert_indices):
+def expert_resetv2(topk_indices, token_expert_indices):
     
     topk_indices_flat = topk_indices.view(-1)  # 展平 [128,4] => [512]
     token_expert_indices_flat = token_expert_indices.view(-1) # 展平 [128,4] => [512]
@@ -249,7 +268,7 @@ def fused_softmax_topk(gating_output, k):
     topk_weights = topk_weights.to(gating_output.dtype)
     return topk_weights, topk_indices, token_expert_indices
 
-def dict_sort(topk_indices,token_expert_indices):
+def dict_sort(topk_indices, token_expert_indices):
     topk_indices_flat = topk_indices.view(-1)
     token_expert_indices_flat = token_expert_indices.view(-1)
 
@@ -271,14 +290,22 @@ def dict_sort(topk_indices,token_expert_indices):
     return torch.tensor(sorted_keys),torch.tensor(sorted_values)
 
 @torch.no_grad()
-def expert_copy(inputs, sorted_token_expert_indices, k):
+def expert_copy(inputs, sorted_token_expert_indices, k, is_half):
     seq_len, hidden_units = inputs.shape  # [128, 2048]
-    # copy_outputs = torch.zeros(seq_len*k, hidden_units).half()  # torch.Size([512, 2048]), 每个token要分配4个专家
-    copy_outputs = torch.zeros(seq_len*k, hidden_units)         # torch.Size([512, 2048]), 每个token要分配4个专家
     dst_2_src_line = torch.zeros(seq_len*k, dtype=torch.int32)  # torch.Size([512]), 记录每行对应
+    copy_outputs = torch.zeros(seq_len*k, hidden_units)         # torch.Size([512, 2048]), 每个token要分配4个专家
+    
+    if is_half:
+        copy_outputs = copy_outputs.half()
+
     for i in range(seq_len*k):
-        dst_2_src_line[sorted_token_expert_indices[i]] = i      # 假设i=126, sorted_token_expert_indices[126] = 1, 那么dst_2_src_line[1] = 126, 说明，copy_outputs的第126行，对应第(1%128=1)个token，top (1/128+1 = 1)
-        copy_outputs[i] = inputs[sorted_token_expert_indices[i] % seq_len]  # 复制4倍后的数组，copy_outputs是按照专家顺序排序的，比如copy_outputs[0:11]对应专家0,
+        # 假设i=126, sorted_token_expert_indices[126] = 1, 那么dst_2_src_line[1] = 126, 
+        # 说明，copy_outputs的第126行，对应第(1%128=1)个token，top (1/128+1 = 1)
+        dst_2_src_line[sorted_token_expert_indices[i]] = i
+        # 行扩充4倍后的数组, copy_outputs是按照专家顺序排序的，
+        # 比如copy_outputs[0:11]对应专家0
+        copy_outputs[i] = inputs[sorted_token_expert_indices[i] % seq_len]  
+
     return copy_outputs, dst_2_src_line
 
 @torch.no_grad()
@@ -288,12 +315,14 @@ def gated_silu(x, dimension):
     return x1 * x2
 
 @torch.no_grad()
-def do_expertv2(copy_outputs,moe_weight1,moe_weight2,total_rows_before_expert):
+def do_expertv2(copy_outputs, moe_weight1, moe_weight2, total_rows_before_expert, is_half):
     # copy_outputs.shape = torch.Size([512, 2048]), moe_weight1.shape = torch.Size([64, 2048, 2816]), moe_weight2.shape = torch.Size([64, 1408, 2048])
-    # gemm_outputs1 = torch.zeros(copy_outputs.shape[0],moe_weight1.shape[-1]).half()  # torch.Size([512, 1408*2])
-    # gemm_outputs2 = torch.zeros(copy_outputs.shape[0],moe_weight2.shape[-1]).half()  # torch.Size([512, 2048])
     gemm_outputs1 = torch.zeros(copy_outputs.shape[0],moe_weight1.shape[-1])  # torch.Size([512, 1408*2])
     gemm_outputs2 = torch.zeros(copy_outputs.shape[0],moe_weight2.shape[-1])  # torch.Size([512, 2048])
+    
+    if is_half:
+        gemm_outputs1 = gemm_outputs1.half()
+        gemm_outputs2 = gemm_outputs2.half()
 
     pre_value=0
     for i in range(len(total_rows_before_expert)):  # [0, 64)
@@ -331,21 +360,23 @@ def do_expertv2(copy_outputs,moe_weight1,moe_weight2,total_rows_before_expert):
     return gemm_outputs2
 
 @torch.no_grad()
-def moe_routing(gemm_outputs, topk_weights, dst_2_src_line):
+def moe_routing(gemm_outputs, topk_weights, dst_2_src_line, is_half):
     seq_len, hidden_units = gemm_outputs.shape  # torch.Size([512, 2048])
     seq_len = seq_len // 4  # 512 => 128
-
-    # outputs = torch.zeros(seq_len, hidden_units).half()  # torch.Size([128, 2048])
     outputs = torch.zeros(seq_len, hidden_units)  # torch.Size([128, 2048])
+
+    if is_half:
+        outputs = outputs.half()
+
     # gemm_outputs是按照专家排序的，所以需要dst_2_src_line来根据token号，找到
     for i in range(seq_len):  # 遍历每个token
         for j in range(4):    # 遍历该token的每个专家
-            outputs[i] += gemm_outputs[dst_2_src_line[j*seq_len+i]] * topk_weights[i][j]  # 
+            outputs[i] += gemm_outputs[dst_2_src_line[i+j*seq_len]] * topk_weights[i][j]  # 
 
     return outputs
 
 @torch.no_grad()
-def ffn(final_outputs,weight1,weight2):
+def ffn(final_outputs, weight1, weight2):
     x= final_outputs@weight1
     x = gated_silu(x,weight1.shape[-1]//2)
     x = x@weight2
@@ -361,51 +392,56 @@ def fused_sigmoid_dot_add(expert_output, shared_expert_output, shared_gate_outpu
     return outputs
 
 @torch.no_grad()
-def mymoe_block(inputs, gate_outputs, k,m1,m2,s1,s2,gate):
+def mymoe_block(inputs, gate_outputs, k, m1_T, m2_T, s1_T, s2_T, gate, is_half):
     """MoE block
 
     Args:
         inputs (tensor): 输入张量, size=[bs, seq_len, hidden_dim]=(1,128,2048)
         k (int): top `k`, 4
-        m1 (tensor): [64, 2048, 1408*2]
-        m2 (tensor): [64, 1408, 2048]
-        s1 (tensor): [2048, 5632*2]
-        s2 (tensor): [5632, 2048]
+        m1_T (tensor): [64, 2048, 1408*2]
+        m2_T (tensor): [64, 1408, 2048]
+        s1_T (tensor): [2048, 5632*2]
+        s2_T (tensor): [5632, 2048]
         gate (nn.module): shared_expert_gate
+        is_half (bool): 是否使用fp16
 
     Returns:
         out (tensor): 和inputs shape相同, [bs, seq_len, hidden_dim]=(1,128,2048)
     """
     topk_weights, topk_indices, token_expert_indices = fused_softmax_topk(gate_outputs, k)
     sorted_topk_indices2, sorted_token_expert_indices2 = expert_resetv2(topk_indices, token_expert_indices)
-    copy_outputs, dst_2_src_line = expert_copy(inputs, sorted_token_expert_indices2, k)
+    copy_outputs, dst_2_src_line = expert_copy(inputs, sorted_token_expert_indices2, k, is_half)
     total_rows_before_expert = compute_total_rows_before_expert(sorted_topk_indices2.tolist(), 64)
-    moe_gemm_outputs = do_expertv2(copy_outputs, m1, m2, total_rows_before_expert)
-    final_outputs = moe_routing(moe_gemm_outputs, topk_weights, dst_2_src_line)
+    moe_gemm_outputs = do_expertv2(copy_outputs, m1_T, m2_T, total_rows_before_expert, is_half)
+    final_outputs = moe_routing(moe_gemm_outputs, topk_weights, dst_2_src_line, is_half)
 
-    b = ffn(inputs, s1, s2)  # shared_expert
+    b = ffn(inputs, s1_T, s2_T)  # shared_expert
     c = gate(inputs)         # shared_gate_layer
 
     out = fused_sigmoid_dot_add(final_outputs, b, c)
 
-    return out
+    return final_outputs
 
 if __name__ == "__main__":
     k = 4
+    is_half = True
     torch.manual_seed(14)
+
     config = Qwen2MoeConfig()
-    # inputs = torch.randn(1, 128, 2048).half()  # [bs, seq_len, hidden_dim]
-    # qwen_moe_block = Qwen2MoeSparseMoeBlock(config).eval().half()
-    inputs = torch.randn(1, 128, 2048)  # [bs, seq_len, hidden_dim]
     qwen_moe_block = Qwen2MoeSparseMoeBlock(config).eval()
-    get_weight(qwen_moe_block)
+    inputs = torch.randn(1, 128, 2048)  # [bs, seq_len, hidden_dim]
+
+    if is_half:
+        inputs = inputs.half()
+        qwen_moe_block = qwen_moe_block.half()
+
     with torch.no_grad():
-        m1, m2 = get_expert_weight(qwen_moe_block)  # [64, 2048, 1408*2], [64, 1408, 2048]
-        s1, s2 = get_shared_expert_weight(qwen_moe_block)  # [2048, 5632*2], [5632, 2048]
-        huggingface_outputs = qwen_moe_block(inputs)  # [seq_len, hidden_dim], [128, 2048]
-        inputs = inputs.view(-1, inputs.shape[-1])  # [128, 2048]
-        gate_outputs = qwen_moe_block.gate(inputs)  # [128, 64]
-        my_outputs = mymoe_block(inputs, gate_outputs, k, m1, m2, s1, s2, qwen_moe_block.shared_expert_gate)
+        m1_T, m2_T = get_expert_weight_T(qwen_moe_block)         # [64, 2048, 1408*2], [64, 1408, 2048]
+        s1_T, s2_T = get_shared_expert_weight_T(qwen_moe_block)  # [2048, 5632*2], [5632, 2048]
+        huggingface_outputs = qwen_moe_block(inputs)             # [seq_len, hidden_dim], [128, 2048]
+        inputs = inputs.view(-1, inputs.shape[-1])               # [128, 2048]
+        gate_outputs = qwen_moe_block.gate(inputs)               # [128, 64]
+        my_outputs = mymoe_block(inputs, gate_outputs, k, m1_T, m2_T, s1_T, s2_T, qwen_moe_block.shared_expert_gate, is_half)
 
     print((huggingface_outputs - my_outputs).max())
     print("done")
