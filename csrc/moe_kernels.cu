@@ -1,5 +1,23 @@
-// ref: https://github.com/NVIDIA/TensorRT-LLM/blob/v0.8.0/cpp/tensorrt_llm/kernels/mixtureOfExperts/moe_kernels.cu
-// ref: TensorRT-LLM-0.8.0/cpp/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_template.h
+/*
+ * Adapted from:
+ * - https://github.com/NVIDIA/TensorRT-LLM/blob/v0.8.0/cpp/tensorrt_llm/kernels/mixtureOfExperts/moe_kernels.cu
+ * - https://github.com/NVIDIA/TensorRT-LLM/blob/v0.8.0/cpp/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_template.h
+ * Copyright (c) 2024, Tongkai Xu.
+ * SPDX-FileCopyrightText: Copyright (c) 1993-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 #include <torch/types.h>
 #include <torch/torch.h>
 #include <torch/extension.h>
@@ -30,7 +48,7 @@ enum class ScaleMode : int
 };
 
 
-// ============================== Gated Activation =================================
+// ============================== gated activation =================================
 
 template <class T, class ActFn>
 __global__ void doGatedActivationKernel(
@@ -129,7 +147,7 @@ __global__ void finalizeMoeRoutingKernel(const T* expanded_permuted_rows, T* red
 }
 
 
-// ============================== Moe Routing =================================
+// ============================== moe_routing =================================
 
 
 template <typename T, int RESIDUAL_NUM>
@@ -146,7 +164,8 @@ void finalizeMoeRoutingKernelLauncherSelectBias(const T* expanded_permuted_rows,
         scales, expanded_source_row_to_expanded_dest_row, expert_for_source_row, cols, k, num_valid_ptr);
 }
 
-// ==============================  =================================
+// ============================== do_expert =================================
+
 struct EpilogueOpDefaultSilu {};
 struct EpilogueOpDefault {};
 
@@ -241,6 +260,7 @@ void genericMoeGemmKernelLauncher(const T* A, const WeightType* B, const T* weig
     }
 }
 
+// ============================== expert_copy =================================
 
 __global__ void expandInputRowsKernel(const float* unpermuted_input, float* permuted_output,
     const int* expanded_dest_row_to_expanded_source_row, int* expanded_source_row_to_expanded_dest_row,
@@ -268,6 +288,8 @@ __global__ void expandInputRowsKernel(const float* unpermuted_input, float* perm
     }
 }
 
+// ======================= compute_total_rows_before_expert ==========================
+
 /**
  * @brief 二分查找。
 */
@@ -291,8 +313,6 @@ __device__ inline int findTotalEltsLeqTarget(const int* sorted_indices, const in
     return target_location + 1;
 }
 
-
-// ======================= compute_total_rows_before_expert ==========================
 
 __global__ void computeTotalRowsBeforeExpertKernel(const int* sorted_experts,
                                                    const int sorted_experts_len,
@@ -523,65 +543,82 @@ torch::Tensor forward(torch::Tensor inputs,
     fc1_expert_weights = fc1_expert_weights.to(device);
     fc2_expert_weights = fc2_expert_weights.to(device);
 
+    // param
+    constexpr int EXPERTS              = 64;
+    constexpr int WARPS_PER_TB         = 4;
+    const int num_rows                 = gate_outputs.size(0);
+    const int64_t hidden_dim           = inputs.size(1);
+    const int total_indices            = num_rows * k;
+    const int64_t expanded_expert_rows = num_rows * k;
+    const int64_t f1_out_rows          = num_rows * k;
+    const int64_t fc1_out_size         = fc1_expert_weights.size(1);
+    const int64_t fc2_out_size         = fc2_expert_weights.size(1);
+    const int64_t inter_size           = fc1_out_size / 2;
+    
+
+    // allocate memory
+    float *topk_weights;
+    int *topk_indices, *token_expert_indices;
+    int *sorted_topk_indices, *sorted_token_expert_indices;
+    int64_t *total_rows_before_expert;
+    float *copy_outputs;
+    int* dst_2_src_line;
+    float *glu_inter_result, *fc1_result, *fc2_result;
+    cudaMalloc((void **)&topk_weights, num_rows * k * sizeof(float));                       // {num_rows, k}
+    cudaMalloc((void **)&topk_indices, num_rows * k * sizeof(int));                         // {num_rows, k}
+    cudaMalloc((void **)&token_expert_indices, num_rows * k * sizeof(int));                 // {num_rows, k}
+    cudaMalloc((void **)&sorted_topk_indices, num_rows * k * sizeof(int));                  // {num_rows, k}
+    cudaMalloc((void **)&sorted_token_expert_indices, num_rows * k * sizeof(int));          // {num_rows, k}
+    cudaMalloc((void **)&total_rows_before_expert, EXPERTS * sizeof(int64_t));              // {EXPERTS}
+    cudaMalloc((void **)&copy_outputs, num_rows * k * hidden_dim * sizeof(float));          // {num_rows * k, hidden_dim}, permuted_data
+    cudaMalloc((void **)&dst_2_src_line, num_rows * k * sizeof(int));                       // {num_rows * k}
+    cudaMalloc((void **)&glu_inter_result, num_rows * k * inter_size * 2 * sizeof(float));  // {num_rows * k, inter_size * 2}
+    cudaMalloc((void **)&fc1_result, num_rows * k * inter_size * sizeof(float));            // {num_rows * k, inter_size}
+    cudaMalloc((void **)&fc2_result, num_rows * k * fc2_out_size * sizeof(float));          // {num_rows * k, fc2_out_size}
+
     // 1. fused_softmax_topk
-    constexpr int EXPERTS = 64;
-    constexpr int WARPS_PER_TB = 4;
-    const int num_rows = gate_outputs.size(0);
-    const int64_t hidden_dim = inputs.size(1);
-    auto topk_weights = torch::zeros({num_rows, k}, torch::TensorOptions().dtype(torch::kFloat)).to(device);
-    auto topk_indices = torch::zeros({num_rows, k}, torch::TensorOptions().dtype(torch::kInt32)).to(device);
-    auto token_expert_indices = torch::zeros({num_rows, k}, torch::TensorOptions().dtype(torch::kInt32)).to(device);
-    fused_softmax_topk<EXPERTS, WARPS_PER_TB>(gate_outputs.data_ptr<float>(), num_rows, k, 
-                                              topk_weights.data_ptr<float>(),
-                                              topk_indices.data_ptr<int>(),
-                                              token_expert_indices.data_ptr<int>());
+    fused_softmax_topk<EXPERTS, WARPS_PER_TB>(gate_outputs.data_ptr<float>(),
+                                              num_rows,               // int
+                                              k,                      // int, 
+                                              topk_weights,           // {num_rows, k}, float
+                                              topk_indices,           // {num_rows, k}, int
+                                              token_expert_indices);  // {num_rows, k}, int
 
     // 2. expert_reset (RadixSort)
     void* sorter_ws = nullptr;
     size_t sorter_ws_size_bytes = 1;
     cudaMalloc(&sorter_ws, sorter_ws_size_bytes);
-    auto sorted_topk_indices = torch::zeros({num_rows, k}, torch::TensorOptions().dtype(torch::kInt32)).to(device);
-    auto sorted_token_expert_indices = torch::zeros({num_rows, k}, torch::TensorOptions().dtype(torch::kInt32)).to(device);
     cub::DeviceRadixSort::SortPairs(
-        (void*) sorter_ws,                              // workspace
-        sorter_ws_size_bytes,                           // workspace_size
-        topk_indices.data_ptr<int>(),                   // keys_in
-        sorted_topk_indices.data_ptr<int>(),            // keys_out
-        token_expert_indices.data_ptr<int>(),           // values_in
-        sorted_token_expert_indices.data_ptr<int>(),    // values_out
-        k * num_rows                                    // num_key_value_pairs
+        (void*) sorter_ws,            // workspace
+        sorter_ws_size_bytes,         // workspace_size
+        topk_indices,                 // keys_in,    {num_rows, k}, int
+        sorted_topk_indices,          // keys_out,   {num_rows, k}, int
+        token_expert_indices,         // values_in,  {num_rows, k}, int
+        sorted_token_expert_indices,  // values_out, {num_rows, k}, int
+        num_rows * k                  // num_key_value_pairs
     );
 
     // 3. compute_total_rows_before_expert
-    const int total_indices = k * num_rows;
     const int threads = std::min(1024, EXPERTS);  // EXPERTS 个线程, 每个线程处理一个专家
     const int blocks  = CEIL(EXPERTS, threads);   // 对于64个专家, 1个block即可
-    auto total_rows_before_expert = torch::zeros({EXPERTS}, torch::TensorOptions().dtype(torch::kInt64)).to(device);
-    computeTotalRowsBeforeExpertKernel<<<blocks, threads>>>(sorted_topk_indices.data_ptr<int>(),
-                                                            total_indices,
+    computeTotalRowsBeforeExpertKernel<<<blocks, threads>>>(sorted_topk_indices,        // {num_rows, k}, int
+                                                            total_indices,              // num_rows * k
                                                             EXPERTS,
-                                                            total_rows_before_expert.data_ptr<int64_t>());
+                                                            total_rows_before_expert);  // {EXPERTS}, int64_t
 
     // 4. expert_copy
-    auto copy_outputs = torch::zeros({num_rows * k, hidden_dim}, torch::TensorOptions().dtype(torch::kFloat)).to(device);  // permuted_data
-    auto dst_2_src_line = torch::zeros({num_rows * k}, torch::TensorOptions().dtype(torch::kInt32)).to(device);
     const int blocks2 = num_rows * k;
     const int threads2 = std::min((int)hidden_dim, 1024);
-    const int64_t num_valid_tokens = num_rows * k;
     expandInputRowsKernel<<<blocks2, threads2>>>(inputs.data_ptr<float>(),
-                                                 copy_outputs.data_ptr<float>(),
-                                                 sorted_token_expert_indices.data_ptr<int>(),
-                                                 dst_2_src_line.data_ptr<int>(),
+                                                 copy_outputs,                 // {num_rows * k, hidden_dim}, float
+                                                 sorted_token_expert_indices,  // {num_rows, k}, int
+                                                 dst_2_src_line,               // {num_rows * k}
                                                  num_rows,
-                                                 num_valid_tokens,
+                                                 expanded_expert_rows,         // num_rows * k
                                                  hidden_dim);
 
-    // 5. do_expertv2
+    // 5. do_expert
     // 5.1 compute gemm_outputs1
-    const int64_t f1_out_rows = k * num_rows;
-    const int64_t fc1_out_size = fc1_expert_weights.size(1);
-    const int64_t inter_size   = fc1_out_size / 2;
-    auto glu_inter_result = torch::zeros({num_rows * k, inter_size * 2}, torch::TensorOptions().dtype(torch::kFloat)).to(device);
     int multi_processor_count;
     cudaDeviceGetAttribute(&multi_processor_count, cudaDevAttrMultiProcessorCount, 0);
     genericMoeGemmKernelLauncher<float,                                         // activation output type
@@ -591,12 +628,12 @@ torch::Tensor forward(torch::Tensor inputs,
                                  cutlass::gemm::GemmShape<128, 128, 8>,         // ThreadblockShape
                                  cutlass::gemm::GemmShape<64, 64, 8>,           // WarpShape
                                  2>(                                            // Stages
-                                copy_outputs.data_ptr<float>(),                 // A
+                                copy_outputs,                                   // A, {num_rows * k, hidden_dim}, float
                                 fc1_expert_weights.data_ptr<float>(),           // B
                                 nullptr,                                        // weight_scales
                                 nullptr,                                        // biases
-                                glu_inter_result.data_ptr<float>(),             // C
-                                total_rows_before_expert.data_ptr<int64_t>(),
+                                glu_inter_result,                               // C, {num_rows * k, inter_size * 2}, float
+                                total_rows_before_expert,                       // {EXPERTS}, int64_t
                                 f1_out_rows,                                    // num_rows
                                 fc1_out_size,                                   // gemm_n
                                 hidden_dim,                                     // gemm_k
@@ -606,17 +643,13 @@ torch::Tensor forward(torch::Tensor inputs,
     // 5.2 compute gated silu_outputs
     const int blocks3 = num_rows * k;
     const int threads3 = std::min((int)inter_size, 1024);
-    auto fc1_result = torch::zeros({num_rows * k, inter_size}, torch::TensorOptions().dtype(torch::kFloat)).to(device); 
     auto* fn = &doGatedActivationKernel<float, cutlass::epilogue::thread::SiLu<float>>;
-    fn<<<blocks3, threads3>>>(fc1_result.data_ptr<float>(),
-                              glu_inter_result.data_ptr<float>(),
-                              num_valid_tokens,
+    fn<<<blocks3, threads3>>>(fc1_result,            // {num_rows * k, inter_size}
+                              glu_inter_result,      // {num_rows * k, inter_size * 2}, float
+                              expanded_expert_rows,  // num_rows * k
                               inter_size);
     
     // 5.3 compute gemm_outputs2
-    const int64_t fc2_out_shape = fc2_expert_weights.size(1);
-    auto fc2_result = torch::zeros({num_rows * k, fc2_out_shape}, torch::TensorOptions().dtype(torch::kFloat)).to(device);
-    int64_t expanded_active_expert_rows = f1_out_rows;
     genericMoeGemmKernelLauncher<float,                                         // activation output type
                                  float,                                         // WeightType
                                  cutlass::arch::Sm80,
@@ -624,33 +657,42 @@ torch::Tensor forward(torch::Tensor inputs,
                                  cutlass::gemm::GemmShape<128, 128, 8>,         // ThreadblockShape
                                  cutlass::gemm::GemmShape<64, 64, 8>,           // WarpShape
                                  2>(                                            // Stages
-                                fc1_result.data_ptr<float>(),                   // A
+                                fc1_result,                                     // A, {num_rows * k, inter_size}
                                 fc2_expert_weights.data_ptr<float>(),           // B
                                 nullptr,                                        // weight_scales
                                 nullptr,                                        // biases
-                                fc2_result.data_ptr<float>(),                   // C
-                                total_rows_before_expert.data_ptr<int64_t>(),
-                                expanded_active_expert_rows,                    // num_rows
+                                fc2_result,                                     // C, {num_rows * k, fc2_expert_weights.size(1)}
+                                total_rows_before_expert,                       // {EXPERTS}, int64_t
+                                expanded_expert_rows,                           // num_rows
                                 hidden_dim,                                     // gemm_n, 是fc1_expert_weights的size(2)/2
                                 inter_size,                                     // gemm_k
                                 EXPERTS,               
-                                multi_processor_count);                         // cudaDevAttrMultiProcessorCount
+                                multi_processor_count);
 
     // 6. moe_routing
-    auto final_output = torch::zeros({num_rows, hidden_dim}, torch::TensorOptions().dtype(torch::kFloat)).to(device);
+    auto final_output = torch::zeros({num_rows, hidden_dim}, torch::TensorOptions().dtype(torch::kFloat).device(device));
     finalizeMoeRoutingKernelLauncherSelectBias<float, 0>(
-        fc2_result.data_ptr<float>(),
+        fc2_result,
         final_output.data_ptr<float>(),
         nullptr,                         // skip_1
         nullptr,                         // skip_2
         nullptr,                         // fc2_expert_biases
-        topk_weights.data_ptr<float>(),  // expert_scales
-        dst_2_src_line.data_ptr<int>(),  // expanded_source_row_to_expanded_dest_row
-        topk_indices.data_ptr<int>(),    // expert_for_source_row
+        topk_weights,                    // expert_scales
+        dst_2_src_line,                  // expanded_source_row_to_expanded_dest_row
+        topk_indices,                    // expert_for_source_row
         num_rows,
         hidden_dim,                      // cols
         k,
-        num_valid_tokens);
+        expanded_expert_rows);
+
+    // free memory
+    cudaFree(topk_weights);
+    cudaFree(topk_indices); cudaFree(token_expert_indices);
+    cudaFree(sorted_topk_indices); cudaFree(sorted_token_expert_indices);
+    cudaFree(total_rows_before_expert);
+    cudaFree(copy_outputs);
+    cudaFree(dst_2_src_line);
+    cudaFree(glu_inter_result); cudaFree(fc1_result); cudaFree(fc2_result);
 
     return final_output;
 }
