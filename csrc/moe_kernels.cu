@@ -48,28 +48,7 @@ enum class ScaleMode : int
 };
 
 
-// ============================== gated activation =================================
-
-template <class T, class ActFn>
-__global__ void doGatedActivationKernel(
-    T* output, const T* gemm_result, const int64_t num_valid_tokens, size_t inter_size)
-{
-    const int tid = threadIdx.x;
-    const int token = blockIdx.x;
-    if (token >= num_valid_tokens) return;
-
-    ActFn fn{};
-    output = output + token * inter_size;
-    gemm_result = gemm_result + token * inter_size * 2;
-    for (int i = tid; i < inter_size; i += blockDim.x)
-    {
-        T gate_value = gemm_result[i];
-        // BF16 isn't supported, use FP32 for activation function
-        float fc1_value = gemm_result[i + inter_size];
-        T gate_act = fn(gate_value);
-        output[i] = gate_act * fc1_value;
-    }
-}
+// ============================== moe_routing =================================
 
 // Final kernel to unpermute and scale
 // This kernel unpermutes the original data, does the k-way reduction and performs the final skip connection.
@@ -78,10 +57,10 @@ __global__ void finalizeMoeRoutingKernel(const T* expanded_permuted_rows, T* red
     const T* skip_2, const T* bias, const float* scales, const int* expanded_source_row_to_expanded_dest_row,
     const int* expert_for_source_row, const int64_t cols, const int k, const int64_t num_valid_ptr)
 {
-    const int original_row = blockIdx.x;
-    const int num_rows = gridDim.x;
+    const int original_row = blockIdx.x;  // 一个block处理输出矩阵的一行
+    const int num_rows = gridDim.x;       // block数量即行数
     const auto offset = original_row * cols;
-    T* reduced_row_ptr = reduced_unpermuted_output + offset;
+    T* reduced_row_ptr = reduced_unpermuted_output + offset;  // 输出矩阵对应行的起始地址
     const T* skip_1_row_ptr{};
     const T* skip_2_row_ptr{};
 
@@ -95,13 +74,15 @@ __global__ void finalizeMoeRoutingKernel(const T* expanded_permuted_rows, T* red
         skip_2_row_ptr = skip_2 + offset;
     }
     const int64_t num_valid = num_valid_ptr;
-    for (int tid = threadIdx.x; tid < cols; tid += blockDim.x)
+    for (int tid = threadIdx.x; tid < cols; tid += blockDim.x)  // tid用于搬运每个元素
     {
         T thread_output{0.f};
         float row_rescale{0.f};
-        for (int k_idx = 0; k_idx < k; ++k_idx)
+        for (int k_idx = 0; k_idx < k; ++k_idx)  // for循环k次，加权求和
         {
+            // 1. 当前行(original_row)的第 k_idx 个专家
             const int expanded_original_row = original_row + k_idx * num_rows;
+            // 2. 查表dst_2_src_line, 找到其位于copy_outputs中的对应行
             const int expanded_permuted_row = expanded_source_row_to_expanded_dest_row[expanded_original_row];
 
             const int64_t k_offset = original_row * k + k_idx;
@@ -117,6 +98,7 @@ __global__ void finalizeMoeRoutingKernel(const T* expanded_permuted_rows, T* red
                 continue;
             }
 
+            // 3. copy_outputs中的对应行的起始地址
             const T* expanded_permuted_rows_row_ptr = expanded_permuted_rows + expanded_permuted_row * cols;
 
             const int expert_idx = expert_for_source_row[k_offset];
@@ -124,6 +106,7 @@ __global__ void finalizeMoeRoutingKernel(const T* expanded_permuted_rows, T* red
             const T* bias_ptr = bias + expert_idx * cols;
             const T bias_value = HAS_BIAS ? bias_ptr[tid] : T(0.f);
 
+            // 4. 累加到thread_output中
             thread_output = static_cast<float>(thread_output)
                 + row_scale * static_cast<float>(expanded_permuted_rows_row_ptr[tid] + bias_value);
         }
@@ -142,12 +125,9 @@ __global__ void finalizeMoeRoutingKernel(const T* expanded_permuted_rows, T* red
         {
             thread_output = thread_output + skip_1_row_ptr[tid] + skip_2_row_ptr[tid];
         }
-        reduced_row_ptr[tid] = thread_output;
+        reduced_row_ptr[tid] = thread_output;  // 累加值保存到输出
     }
 }
-
-
-// ============================== moe_routing =================================
 
 
 template <typename T, int RESIDUAL_NUM>
@@ -162,6 +142,29 @@ void finalizeMoeRoutingKernelLauncherSelectBias(const T* expanded_permuted_rows,
     auto* const func = &finalizeMoeRoutingKernel<T, RESIDUAL_NUM, false, ScaleMode::DEFAULT, false>;
     func<<<blocks, threads>>>(expanded_permuted_rows, reduced_unpermuted_output, skip_1, skip_2, bias,
         scales, expanded_source_row_to_expanded_dest_row, expert_for_source_row, cols, k, num_valid_ptr);
+}
+
+// ============================== gated activation =================================
+
+template <class T, class ActFn>
+__global__ void doGatedActivationKernel(
+    T* output, const T* gemm_result, const int64_t num_valid_tokens, size_t inter_size)
+{
+    const int tid = threadIdx.x;
+    const int token = blockIdx.x;
+    if (token >= num_valid_tokens) return;
+
+    ActFn fn{};
+    output = output + token * inter_size;
+    gemm_result = gemm_result + token * inter_size * 2;
+    for (int i = tid; i < inter_size; i += blockDim.x)
+    {
+        T gate_value = gemm_result[i];
+        // BF16 isn't supported, use FP32 for activation function
+        T gate_act = fn(gate_value);                    // 左半矩阵经过激活函数
+        float fc1_value = gemm_result[i + inter_size];  // 右半矩阵保持不变
+        output[i] = gate_act * fc1_value;               // 哈达玛积
+    }
 }
 
 // ============================== do_expert =================================
@@ -262,11 +265,15 @@ void genericMoeGemmKernelLauncher(const T* A, const WeightType* B, const T* weig
 
 // ============================== expert_copy =================================
 
-__global__ void expandInputRowsKernel(const float* unpermuted_input, float* permuted_output,
-    const int* expanded_dest_row_to_expanded_source_row, int* expanded_source_row_to_expanded_dest_row,
-    const int num_rows, const int64_t num_dest_rows, const int cols)
+__global__ void expandInputRowsKernel(const float* unpermuted_input, 
+                                      float* permuted_output,
+                                      const int* expanded_dest_row_to_expanded_source_row,
+                                      int* expanded_source_row_to_expanded_dest_row,
+                                      const int num_rows,
+                                      const int64_t num_dest_rows, 
+                                      const int cols)
 {
-    const int expanded_dest_row = blockIdx.x;  // 0-numtoken * 4 
+    const int expanded_dest_row = blockIdx.x;  // 0-num_token * 4, 每个block搬运一行
     const int expanded_source_row = expanded_dest_row_to_expanded_source_row[expanded_dest_row];
     if (threadIdx.x == 0)
     {   
@@ -276,12 +283,12 @@ __global__ void expandInputRowsKernel(const float* unpermuted_input, float* perm
 
     if (blockIdx.x < num_dest_rows)
     {
-        const int source_row = expanded_source_row % num_rows;
+        const int source_row = expanded_source_row % num_rows;  // 当前线程要搬运inputs的哪一行
 
-        const float* source_row_ptr = unpermuted_input + source_row * cols;
-        float* dest_row_ptr = permuted_output + expanded_dest_row * cols;
+        const float* source_row_ptr = unpermuted_input + source_row * cols;  // inputs对应行的起始地址
+        float* dest_row_ptr = permuted_output + expanded_dest_row * cols;  // 目标行的起始地址
 
-        for (int tid = threadIdx.x; tid < cols; tid += blockDim.x)
+        for (int tid = threadIdx.x; tid < cols; tid += blockDim.x)  // 调动每个线程进行搬运，当线程数小于列数，一个线程将搬运多次
         {
             dest_row_ptr[tid] = source_row_ptr[tid];
         }
