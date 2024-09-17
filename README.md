@@ -1,8 +1,15 @@
 # MoE_inference
-实现 Qwen1.5-MOE-A2.7B 大模型中 MoE-FFN 层所需的前向算子，并与 Pytorch 推理源码进行精度对齐。
+本项目用于梳理 Qwen1.5-MOE-A2.7B 大模型中 MoE FFN 层的并行逻辑。
 
-## MoE-FFN 流程
-参考 [qwen_moe_block.md](./docs/qwen_moe_block.md) 。
+## MoE FFN 介绍
+对于混合专家模型（MoE），其中每个专家（Expert）为一个 FFN，每个 token 将分配给 topK 个专家进行处理。Qwen 源码中的 FFN 部分按串行逻辑编写，通过循环遍历每个专家索引，从原输入中切片得到对应 token，而后计算FFN。
+
+为并行化，需要对每个 token 按专家复制重排并分组处理。
+
+## 代码文件说明
+- csrc/moe_kernels.cu：MoE FFN 中的关键 Kernel，此部分修改自 [TensorRT-LLM-v0.8.0](https://github.com/NVIDIA/TensorRT-LLM/blob/v0.8.0/cpp/tensorrt_llm/kernels/mixtureOfExperts/moe_kernels.cu)
+- qwen_moe_block.py：含[Qwen](https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen2_moe/modeling_qwen2_moe.py)推理源码，以及按 CUDA Kernel 逻辑编写的 Pytorch 流程，用于验证逻辑正确性，可参阅[说明文档](./docs/qwen_moe_block.md) 
+- bench.py：用于 CUDA Kernel 精度对齐与 profiling
 
 ## 测试 CUDA 算子
 requirements：
