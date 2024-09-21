@@ -1,5 +1,8 @@
 # MoE_inference
-本项目用于梳理 Qwen1.5-MOE-A2.7B 大模型中 MoE FFN 层的并行逻辑。
+本项目：
+- 梳理 Qwen1.5-MOE-A2.7B 大模型中 MoE FFN 层的并行逻辑
+- MoE FFN 层 CUDA 算子编写与优化
+- 精度对齐与 profiling
 
 ## MoE FFN 介绍
 对于混合专家模型（MoE），其中每个专家（Expert）为一个 FFN，每个 token 将分配给 topK 个专家进行处理。Qwen 源码中的 FFN 部分按串行逻辑编写，通过循环遍历每个专家索引，从原输入中切片得到对应 token，而后计算FFN。
